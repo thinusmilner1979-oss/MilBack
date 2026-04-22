@@ -18,3 +18,5 @@
 * **Language:** Python 3
 * **GUI Framework:** PyQt6
 * **Platform:** Linux (Debian-based)
+<img width="1103" height="880" alt="image" src="https://github.com/user-attachments/assets/48eb0124-7507-4283-abf7-375d5f7e71a8" />
+
