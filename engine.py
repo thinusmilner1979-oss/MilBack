@@ -117,6 +117,8 @@ class BackupWorker(QThread):
         self._job_errors = 0
         self._no_utime = False
         self._no_fsync = False
+        self.reasons = {}
+        self.reason_bytes = {}
 
     def stop(self):
         self.is_running = False
@@ -197,6 +199,9 @@ class BackupWorker(QThread):
             "copy_errors": len(self.copy_errors),
             "stopped_early": not self.is_running,
         }
+        for category, count in sorted(self.reasons.items(), key=lambda kv: -kv[1]):
+            self._say(f"---   {count:,} files {category} "
+                      f"({human(self.reason_bytes.get(category, 0))})")
         self._say(
             f"--- {'DRY RUN' if self.dry_run else 'DONE'}: {c.files_done:,} copied "
             f"({human(c.bytes_done)} at {human(c.bytes_done / elapsed)}/s), "
@@ -274,8 +279,7 @@ class BackupWorker(QThread):
                     return None
         return None
 
-    @staticmethod
-    def _dest_listing(path):
+    def _dest_listing(self, path):
         # One directory listing instead of a stat per file. On a share that is
         # one round trip for the whole folder rather than one for each entry.
         try:
@@ -288,7 +292,13 @@ class BackupWorker(QThread):
                     except OSError:
                         pass
                 return out
-        except OSError:
+        except FileNotFoundError:
+            return {}
+        except OSError as e:
+            # An unreadable folder is not an empty one. Saying nothing here
+            # would queue every file in it as new.
+            self._fail(f"DESTINATION FOLDER UNREADABLE, its files will all look "
+                       f"new: {path} - {e.strerror}", self.scan_errors)
             return {}
 
     def _walk(self, src_root, dst_root, dst_base, key, known, seen, structure):
@@ -350,13 +360,18 @@ class BackupWorker(QThread):
                     if dest_files is None:
                         dest_files = self._dest_listing(current_dst)
 
-                    if self._needs_copy(st, dest_files.get(entry.name),
-                                        entry.path, target_path):
+                    verdict = self._needs_copy(st, dest_files.get(entry.name),
+                                               entry.path, target_path)
+                    if verdict:
+                        category, detail = verdict
                         with self.c.lock:
                             self.c.files_found += 1
                             self.c.bytes_found += st.st_size
+                            self.reasons[category] = self.reasons.get(category, 0) + 1
+                            self.reason_bytes[category] = (
+                                self.reason_bytes.get(category, 0) + st.st_size)
                         self._queue.put({
-                            "src": entry.path, "dst": target_path,
+                            "src": entry.path, "dst": target_path, "why": detail,
                             "size": st.st_size, "mtime": st.st_mtime, "job": key,
                         })
                     else:
@@ -374,19 +389,24 @@ class BackupWorker(QThread):
         return size == st.st_size and abs(mtime - st.st_mtime) <= self.mtime_tolerance
 
     def _needs_copy(self, st, dest_entry, src_path, dst_path):
+        """Returns (category, detail) explaining the copy, or None to skip."""
         if self.backup_mode == MODE_OVERWRITE:
-            return True
+            return ("full overwrite", "full overwrite")
         if dest_entry is None:
-            return True
+            return ("not in backup", "not in backup")
         size, mtime = dest_entry
         if size != st.st_size:
-            return True
-        if abs(mtime - st.st_mtime) > self.mtime_tolerance:
-            return True
+            return ("different size", f"size {size:,} -> {st.st_size:,}")
+        drift = st.st_mtime - mtime
+        if abs(drift) > self.mtime_tolerance:
+            hours = abs(drift) / 3600
+            return ("different timestamp",
+                    f"source is {hours:,.1f}h {'newer' if drift > 0 else 'older'}")
         if self.deep_verify:
             full = not self.quick_verify
-            return file_digest(src_path, full) != file_digest(dst_path, full)
-        return False
+            if file_digest(src_path, full) != file_digest(dst_path, full):
+                return ("contents differ", "contents differ")
+        return None
 
     def _copy_worker(self):
         while True:
@@ -398,7 +418,7 @@ class BackupWorker(QThread):
                 if not self.is_running:
                     continue
                 if self.dry_run:
-                    self._chatter(f"would copy: {task['src']}")
+                    self._chatter(f"would copy [{task['why']}]: {task['src']}")
                     with self.c.lock:
                         self.c.files_done += 1
                         self.c.bytes_done += task["size"]
