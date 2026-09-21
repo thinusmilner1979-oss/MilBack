@@ -6,6 +6,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /usr/share/milback/cli.py
+ExecStart=/usr/bin/milback-cli
 Nice=10
 IOSchedulingClass=idle

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=MilBack
+Comment=Resilient System & Network Backup Engine
+Exec=milback
+Icon=milback
+Terminal=false
+Type=Application
+Categories=Utility;System;Archiving;
