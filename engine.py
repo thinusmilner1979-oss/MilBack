@@ -115,6 +115,8 @@ class BackupWorker(QThread):
         self._index_writes = []
         self._deleted = 0
         self._job_errors = 0
+        self._no_utime = False
+        self._no_fsync = False
 
     def stop(self):
         self.is_running = False
@@ -477,7 +479,13 @@ class BackupWorker(QThread):
                         self.c.bytes_done += len(chunk)
                     self._tick(len(chunk))
                 f_out.flush()
-                os.fsync(f_out.fileno())
+                try:
+                    os.fsync(f_out.fileno())
+                except OSError as e:
+                    if not self._no_fsync:
+                        self._no_fsync = True
+                        self._say(f"Destination does not support fsync ({e.strerror}); "
+                                  f"copies are written but not forced to disk.")
 
             if not self.is_running:
                 return False
@@ -487,7 +495,14 @@ class BackupWorker(QThread):
                 return False
 
             st = os.stat(src)
-            os.utime(part, (st.st_atime, st.st_mtime))
+            try:
+                os.utime(part, (st.st_atime, st.st_mtime))
+            except OSError as e:
+                if not self._no_utime:
+                    self._no_utime = True
+                    self._say(f"Destination will not accept file timestamps "
+                              f"({e.strerror}). Copies are correct, but every run "
+                              f"will see them as changed and copy them again.")
             try:
                 os.chmod(part, st.st_mode & 0o7777)
             except OSError:
