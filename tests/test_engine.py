@@ -345,5 +345,43 @@ class TestVerification(EngineCase):
         self.assertEqual(full["copied"], 1)
 
 
+class TestAwkwardDestinations(EngineCase):
+    def _refuse(self, name):
+        real = getattr(os, name)
+
+        def refusing(target, *a, **kw):
+            if isinstance(target, str) and self.dst in target:
+                raise OSError(95, "Operation not supported")
+            return real(target, *a, **kw)
+
+        setattr(os, name, refusing)
+        self.addCleanup(setattr, os, name, real)
+
+    def test_destination_refusing_utime_still_gets_the_files(self):
+        for i in range(5):
+            write(os.path.join(self.src, f"f{i}.txt"))
+        self._refuse("utime")
+        result, logs, _, _ = self.backup()
+        self.assertEqual(result["copied"], 5)
+        self.assertEqual(len(tree(self.backup_dir())), 5)
+        self.assertTrue(any("will not accept file timestamps" in l for l in logs))
+
+    def test_the_warning_is_given_once_not_per_file(self):
+        for i in range(5):
+            write(os.path.join(self.src, f"f{i}.txt"))
+        self._refuse("utime")
+        _, logs, _, _ = self.backup()
+        said = [l for l in logs if "will not accept file timestamps" in l]
+        self.assertEqual(len(said), 1)
+
+    def test_copies_are_intact_despite_the_refusal(self):
+        data = os.urandom(9000)
+        write(os.path.join(self.src, "a.bin"), data)
+        self._refuse("utime")
+        self.backup()
+        with open(os.path.join(self.backup_dir(), "a.bin"), "rb") as f:
+            self.assertEqual(f.read(), data)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
