@@ -19,6 +19,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import profiles as profile_store
+from version import version_string
 
 PROBE_COUNT = 30
 
@@ -178,6 +179,7 @@ def check_job(src, dst, mode):
 
 
 def main():
+    print(f"{version_string()} doctor")
     args = [a for a in sys.argv[1:]]
     if "--src" in args:
         check_job(args[args.index("--src") + 1], args[args.index("--dst") + 1],

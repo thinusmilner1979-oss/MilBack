@@ -15,6 +15,7 @@ import profiles as profile_store
 from engine import (MODE_INCREMENTAL, MODE_MIRROR, MODE_OVERWRITE, VERSION_KEEP,
                     VERSION_NONE, VERSION_SNAPSHOT, BackupWorker, human)
 from runlog import load_status
+from version import version_string
 
 LOG_LINE_LIMIT = 2000
 
@@ -22,7 +23,7 @@ LOG_LINE_LIMIT = 2000
 class MilBackWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MilBack v1.1.0")
+        self.setWindowTitle(version_string())
         self.resize(1100, 880)
 
         self.profiles = {}

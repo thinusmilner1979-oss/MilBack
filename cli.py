@@ -10,6 +10,7 @@ from PyQt6.QtCore import QCoreApplication, QEventLoop
 import profiles as profile_store
 from engine import BackupWorker
 from runlog import load_status
+from version import __version__, version_string
 
 
 def run_profile(name, profile, dry_run=False, quiet=False):
@@ -34,7 +35,7 @@ def run_profile(name, profile, dry_run=False, quiet=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="milback-cli",
-        description="Run MilBack profiles without the GUI.")
+        description=f"Run MilBack profiles without the GUI. ({version_string()})")
     parser.add_argument("profile", nargs="?",
                         help="profile name; omit to run every scheduled profile "
                              "that is currently due")
@@ -46,6 +47,8 @@ def main(argv=None):
                         help="list profiles and their last run")
     parser.add_argument("--quiet", action="store_true",
                         help="only print errors")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
 
     # Kept in a local: an unreferenced QCoreApplication is collected, and the
