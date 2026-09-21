@@ -383,5 +383,42 @@ class TestAwkwardDestinations(EngineCase):
             self.assertEqual(f.read(), data)
 
 
+class TestWhyFilesAreQueued(EngineCase):
+    def test_a_missing_file_says_not_in_backup(self):
+        write(os.path.join(self.src, "a.txt"))
+        _, logs, _, _ = self.backup(dry_run=True)
+        self.assertTrue(any("[not in backup]" in l for l in logs), logs)
+
+    def test_a_resized_file_says_so(self):
+        path = write(os.path.join(self.src, "a.txt"), b"x" * 100)
+        self.backup()
+        write(path, b"x" * 250)
+        _, logs, _, _ = self.backup(dry_run=True)
+        self.assertTrue(any("size 100 -> 250" in l for l in logs), logs)
+
+    def test_the_summary_breaks_the_total_down(self):
+        write(os.path.join(self.src, "keep.txt"))
+        self.backup()
+        for i in range(3):
+            write(os.path.join(self.src, f"new{i}.txt"))
+        _, logs, _, _ = self.backup(dry_run=True)
+        self.assertTrue(any("3 files not in backup" in l for l in logs), logs)
+
+    def test_an_unreadable_destination_folder_is_reported(self):
+        write(os.path.join(self.src, "a.txt"))
+        self.backup()
+        real = os.scandir
+
+        def blind(path=".", *a, **kw):
+            if isinstance(path, str) and self.dst in path:
+                raise OSError(5, "Input/output error")
+            return real(path, *a, **kw)
+
+        os.scandir = blind
+        self.addCleanup(setattr, os, "scandir", real)
+        _, _, errors, _ = self.backup(dry_run=True)
+        self.assertTrue(any("DESTINATION FOLDER UNREADABLE" in e for e in errors), errors)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
