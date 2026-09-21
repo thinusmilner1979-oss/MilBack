@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MilBack (background)
+Comment=Keep MilBack running in the system tray for scheduled backups
+Exec=/usr/bin/python3 /usr/share/milback/main.py --tray
+Icon=drive-removable-media
+Terminal=false
+Categories=Utility;Archiving;
+X-GNOME-Autostart-enabled=true

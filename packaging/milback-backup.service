@@ -1,0 +1,11 @@
+[Unit]
+Description=MilBack scheduled backup
+Documentation=https://github.com/thinusmilner1979-oss/MilBack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/share/milback/cli.py
+Nice=10
+IOSchedulingClass=idle
