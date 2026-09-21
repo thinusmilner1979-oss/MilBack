@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import profiles as profile_store
+import version
 
 
 def daily(at="02:00", catch_up=True):
@@ -126,6 +128,27 @@ class TestProfileStorage(unittest.TestCase):
         self.assertTrue(settings["deep_verify"])
         self.assertEqual(settings["workers"], 8)
         self.assertEqual(settings["backup_mode"], "Exact Sync (Mirror)")
+
+
+class TestVersion(unittest.TestCase):
+    def test_version_is_semver(self):
+        parts = version.__version__.split(".")
+        self.assertEqual(len(parts), 3)
+        self.assertTrue(all(p.isdigit() for p in parts), version.__version__)
+
+    def test_nothing_hardcodes_a_version(self):
+        # The window title carried its own copy and drifted from the released
+        # .deb. Everything reads version.py now, so keep it that way.
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        pattern = re.compile(r"v?\d+\.\d+\.\d+")
+        for name in ("main.py", "cli.py", "milback_doctor.py", "engine.py"):
+            text = open(os.path.join(root, name), encoding="utf-8").read()
+            self.assertIsNone(pattern.search(text),
+                              f"{name} hardcodes a version; import it from version.py")
+
+    def test_version_string_format(self):
+        self.assertEqual(version.version_string(),
+                         f"MilBack v{version.__version__}")
 
 
 if __name__ == "__main__":
