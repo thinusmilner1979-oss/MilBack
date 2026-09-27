@@ -262,6 +262,149 @@ class TestMirrorSafety(EngineCase):
         self.assertTrue(any("CLEANUP SKIPPED" in line for line in logs))
 
 
+    def test_one_bad_job_does_not_block_another_jobs_cleanup(self):
+        # Scanning now finishes for every job before any cleanup runs, so a
+        # later job's scan errors must not be mistaken for this job's.
+        good_src = os.path.join(self.tmp, "src", "Good")
+        bad_src = os.path.join(self.tmp, "src", "Bad")
+        for i in range(20):
+            write(os.path.join(good_src, f"keep{i}.txt"))
+        write(os.path.join(bad_src, "a.txt"))
+        good_backup = os.path.join(self.dst, "Good")
+        stale = write(os.path.join(good_backup, "stale.txt"))
+        locked = os.path.join(bad_src, "locked")
+        os.makedirs(locked, exist_ok=True)
+
+        worker = BackupWorker({
+            "jobs": [{"src": good_src, "dst": self.dst},
+                     {"src": bad_src, "dst": self.dst}],
+            "backup_mode": MODE_MIRROR, "workers": 2}, "test")
+        real_listdir = worker._listdir
+
+        def flaky(path):
+            if path == locked:
+                worker._fail(f"FOLDER FAILED: {path}", worker.scan_errors)
+                return None
+            return real_listdir(path)
+
+        worker._listdir = flaky
+        loop = QEventLoop()
+        worker.finished.connect(lambda *a: loop.quit())
+        guard = QTimer(); guard.setSingleShot(True)
+        guard.timeout.connect(loop.quit); guard.start(30000)
+        worker.start(); loop.exec(); worker.wait(5000)
+
+        self.assertFalse(os.path.exists(stale),
+                         "the clean job's cleanup must still run")
+
+
+class TestDuration(unittest.TestCase):
+    def test_reads_as_time(self):
+        self.assertEqual(engine.duration(0), "0s")
+        self.assertEqual(engine.duration(45.6), "45s")
+        self.assertEqual(engine.duration(60), "1m 00s")
+        self.assertEqual(engine.duration(605), "10m 05s")
+        self.assertEqual(engine.duration(3600), "1h 00m")
+        self.assertEqual(engine.duration(7325), "2h 02m")
+        self.assertEqual(engine.duration(-5), "0s")
+
+
+class TestPhases(EngineCase):
+    def test_the_scan_names_each_file_it_queues(self):
+        write(os.path.join(self.src, "one.txt"))
+        _, logs, _, _ = self.backup(workers=1)
+        queued = [l for l in logs if l.startswith("queued [")]
+        self.assertTrue(queued, logs)
+        self.assertIn("one.txt", queued[0])
+        self.assertIn("not in backup", queued[0])
+        # Named while scanning, so before the scan has ended.
+        self.assertLess(logs.index(queued[0]),
+                        next(i for i, l in enumerate(logs)
+                             if l.startswith("--- SCANNED in ")))
+
+    def test_a_dry_run_says_would_copy_instead(self):
+        write(os.path.join(self.src, "one.txt"))
+        _, logs, _, _ = self.backup(dry_run=True, workers=1)
+        self.assertTrue(any(l.startswith("would copy [") for l in logs), logs)
+        self.assertFalse(any(l.startswith("queued [") for l in logs), logs)
+
+    def test_byte_updates_do_not_starve_the_per_file_lines(self):
+        # These shared one clock, so the byte counter - which fires far more
+        # often - kept resetting it and the per-file lines never got through.
+        worker = BackupWorker({"jobs": []}, "test")
+        worker._last_chatter = 0.0
+        for _ in range(50):
+            worker._tick(1)
+        self.assertEqual(worker._last_chatter, 0.0,
+                         "a byte update must not delay the next file line")
+
+    def test_scan_reports_how_long_it_took(self):
+        write(os.path.join(self.src, "a.txt"))
+        _, logs, _, _ = self.backup()
+        line = [l for l in logs if l.startswith("--- SCANNED in ")]
+        self.assertEqual(len(line), 1, logs)
+        self.assertIn("1 files examined", line[0])
+
+    def test_nothing_is_copied_before_scanning_ends(self):
+        second = os.path.join(self.tmp, "src", "Second")
+        for i in range(10):
+            write(os.path.join(self.src, f"a{i}.txt"))
+            write(os.path.join(second, f"b{i}.txt"))
+
+        worker = BackupWorker({
+            "jobs": [{"src": self.src, "dst": self.dst},
+                     {"src": second, "dst": self.dst}],
+            "workers": 3}, "test")
+        seen_at_scan_end = {}
+        worker.scan_finished.connect(
+            lambda files, nbytes: seen_at_scan_end.update(
+                files=files, nbytes=nbytes, on_disk=tree(self.dst)))
+        loop = QEventLoop()
+        result = {}
+        worker.finished.connect(
+            lambda f, c, u: (result.update(copied=c), loop.quit()))
+        guard = QTimer(); guard.setSingleShot(True)
+        guard.timeout.connect(loop.quit); guard.start(30000)
+        worker.start(); loop.exec(); worker.wait(5000)
+
+        self.assertEqual(seen_at_scan_end["on_disk"], {},
+                         "the destination must be untouched while scanning")
+        self.assertEqual(seen_at_scan_end["files"], 20)
+        self.assertEqual(result["copied"], 20)
+        self.assertEqual(len(tree(self.dst)), 20)
+
+    def test_scan_total_is_final_before_copying(self):
+        sizes = [512, 4096, 10_000]
+        for i, n in enumerate(sizes):
+            write(os.path.join(self.src, f"f{i}.bin"), b"z" * n)
+        totals = []
+        worker = BackupWorker({"jobs": [{"src": self.src, "dst": self.dst}],
+                               "workers": 2}, "test")
+        worker.scan_finished.connect(lambda f, b: totals.append((f, b)))
+        loop = QEventLoop()
+        worker.finished.connect(lambda *a: loop.quit())
+        guard = QTimer(); guard.setSingleShot(True)
+        guard.timeout.connect(loop.quit); guard.start(30000)
+        worker.start(); loop.exec(); worker.wait(5000)
+
+        self.assertEqual(len(totals), 1, "scan_finished must fire exactly once")
+        self.assertEqual(totals[0], (3, sum(sizes)))
+
+    def test_scan_finished_fires_even_with_nothing_to_do(self):
+        write(os.path.join(self.src, "a.txt"))
+        self.backup()
+        totals = []
+        worker = BackupWorker({"jobs": [{"src": self.src, "dst": self.dst}],
+                               "workers": 2}, "test")
+        worker.scan_finished.connect(lambda f, b: totals.append((f, b)))
+        loop = QEventLoop()
+        worker.finished.connect(lambda *a: loop.quit())
+        guard = QTimer(); guard.setSingleShot(True)
+        guard.timeout.connect(loop.quit); guard.start(30000)
+        worker.start(); loop.exec(); worker.wait(5000)
+        self.assertEqual(totals, [(0, 0)])
+
+
 class TestDryRun(EngineCase):
     def test_dry_run_writes_nothing(self):
         write(os.path.join(self.src, "a.txt"))
@@ -269,6 +412,19 @@ class TestDryRun(EngineCase):
         self.assertEqual(result["copied"], 1)
         self.assertFalse(os.path.exists(self.backup_dir()))
         self.assertTrue(any("would copy" in line for line in logs))
+
+    def test_dry_run_claims_no_transfer_speed(self):
+        write(os.path.join(self.src, "a.txt"))
+        _, logs, _, _ = self.backup(dry_run=True)
+        summary = [line for line in logs if line.startswith("--- DRY RUN:")][-1]
+        self.assertNotIn("/s", summary)
+        self.assertIn("would be copied", summary)
+
+    def test_real_run_reports_transfer_speed(self):
+        write(os.path.join(self.src, "a.txt"))
+        _, logs, _, _ = self.backup()
+        summary = [line for line in logs if line.startswith("--- DONE:")][-1]
+        self.assertIn("/s", summary)
 
     def test_dry_run_does_not_delete(self):
         write(os.path.join(self.src, "keep.txt"))
