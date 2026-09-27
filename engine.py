@@ -37,6 +37,15 @@ def human(n):
     return f"{n:.1f} PB"
 
 
+def duration(seconds):
+    seconds = int(max(seconds, 0))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+
+
 def file_digest(path, full=True, chunk=1024 * 1024):
     h = hashlib.blake2b(digest_size=16)
     try:
@@ -74,6 +83,8 @@ class BackupWorker(QThread):
     error_found = pyqtSignal(str)
     task_stats_ready = pyqtSignal(int, object)
     chunk_finished = pyqtSignal(object)
+    scan_progress = pyqtSignal(int, int, object, str)
+    scan_finished = pyqtSignal(int, object)
     # Shadows QThread.finished on purpose; main.py connects to this one.
     finished = pyqtSignal(int, int, int)
 
@@ -107,14 +118,17 @@ class BackupWorker(QThread):
         self.scan_errors = []
         self.copy_errors = []
         self._errors_emitted = 0
-        self._last_ui = 0.0
+        self._last_chatter = 0.0
+        self._last_tick = 0.0
         self._emit_lock = threading.Lock()
         self._index = None
         self._log = None
         self._queue = queue.Queue(maxsize=2000)
+        self._plan = []
+        self._scanning = True
         self._index_writes = []
         self._deleted = 0
-        self._job_errors = 0
+        self._scan_seconds = 0.0
         self._no_utime = False
         self._no_fsync = False
         self.reasons = {}
@@ -134,8 +148,8 @@ class BackupWorker(QThread):
         if self._log:
             self._log.write(message)
         now = time.time()
-        if (now - self._last_ui) > (1.0 / self.UI_HZ):
-            self._last_ui = now
+        if (now - self._last_chatter) > (1.0 / self.UI_HZ):
+            self._last_chatter = now
             self.progress_update.emit(message)
 
     def _fail(self, message, bucket):
@@ -163,17 +177,39 @@ class BackupWorker(QThread):
             self._finish(started)
             return
 
-        pool = ThreadPoolExecutor(max_workers=self.workers)
-        futures = [pool.submit(self._copy_worker) for _ in range(self.workers)]
-        try:
-            for job in self.jobs:
-                if not self.is_running:
-                    break
-                self._run_job(job)
-        finally:
-            for _ in futures:
-                self._queue.put(None)
-            pool.shutdown(wait=True)
+        plans = []
+        for job in self.jobs:
+            if not self.is_running:
+                break
+            plan = self._scan_job(job)
+            if plan:
+                plans.append(plan)
+
+        self._scanning = False
+        self._scan_seconds = time.time() - started
+        self._say(f"--- SCANNED in {duration(self._scan_seconds)}: "
+                  f"{self.c.entries_seen:,} files examined, "
+                  f"{self.c.files_found:,} to copy ({human(self.c.bytes_found)}) ---")
+        self.scan_finished.emit(self.c.files_found, self.c.bytes_found)
+
+        if self.is_running and self._plan:
+            pool = ThreadPoolExecutor(max_workers=self.workers)
+            futures = [pool.submit(self._copy_worker) for _ in range(self.workers)]
+            try:
+                for task in self._plan:
+                    if not self.is_running:
+                        break
+                    self._queue.put(task)
+            finally:
+                for _ in futures:
+                    self._queue.put(None)
+                pool.shutdown(wait=True)
+        self._plan = []
+
+        for plan in plans:
+            if not self.is_running:
+                break
+            self._finish_job(plan)
 
         if self._index_writes:
             self._index.record_many(self._index_writes)
@@ -195,6 +231,7 @@ class BackupWorker(QThread):
             "files_in_use": c.in_use,
             "files_deleted": self._deleted,
             "bytes_copied": c.bytes_done,
+            "scan_seconds": round(self._scan_seconds, 1),
             "scan_errors": len(self.scan_errors),
             "copy_errors": len(self.copy_errors),
             "stopped_early": not self.is_running,
@@ -202,31 +239,34 @@ class BackupWorker(QThread):
         for category, count in sorted(self.reasons.items(), key=lambda kv: -kv[1]):
             self._say(f"---   {count:,} files {category} "
                       f"({human(self.reason_bytes.get(category, 0))})")
-        self._say(
-            f"--- {'DRY RUN' if self.dry_run else 'DONE'}: {c.files_done:,} copied "
-            f"({human(c.bytes_done)} at {human(c.bytes_done / elapsed)}/s), "
-            f"{c.skipped:,} unchanged, {c.failed:,} failed, "
-            f"{self._deleted:,} removed, {len(self.scan_errors):,} scan errors ---")
+        if self.dry_run:
+            head = (f"--- DRY RUN: {c.files_done:,} would be copied "
+                    f"({human(c.bytes_done)})")
+        else:
+            head = (f"--- DONE: {c.files_done:,} copied "
+                    f"({human(c.bytes_done)} at {human(c.bytes_done / elapsed)}/s)")
+        self._say(f"{head}, {c.skipped:,} unchanged, {c.failed:,} failed, "
+                  f"{self._deleted:,} removed, {len(self.scan_errors):,} scan errors ---")
         if self._log:
             self._log.close(summary)
         if self._index:
             self._index.close()
         self.finished.emit(c.files_found, c.files_done, c.in_use)
 
-    def _run_job(self, job):
+    def _scan_job(self, job):
         src = os.path.abspath(job["src"].rstrip(os.sep))
         dst_base = os.path.abspath(job["dst"])
         target_root = os.path.join(dst_base, os.path.basename(src))
         key = job_key(src, dst_base)
 
-        self._job_errors = len(self.scan_errors)
+        errors_before = len(self.scan_errors)
 
         if not os.path.isdir(src):
             self._fail(f"SOURCE MISSING: {src}", self.scan_errors)
-            return
+            return None
         if not os.path.isdir(dst_base):
             self._fail(f"DESTINATION MISSING: {dst_base}", self.scan_errors)
-            return
+            return None
 
         known = self._index.load_job(key) if self.trust_index else {}
         due = (time.time() - self._index.last_verify(key)) > (
@@ -240,21 +280,27 @@ class BackupWorker(QThread):
         structure = set() if self.backup_mode == MODE_MIRROR else None
         self._walk(src, target_root, dst_base, key, known, seen, structure)
 
-        self._queue.join()
+        return {
+            "src": src, "target_root": target_root, "key": key,
+            "known": bool(known), "seen": seen, "structure": structure,
+            # Captured now, not at cleanup time: by then later jobs have added
+            # their own scan errors, which say nothing about this job.
+            "scan_failed": len(self.scan_errors) > errors_before,
+        }
 
-        if not self.is_running:
-            return
-
+    def _finish_job(self, plan):
+        key = plan["key"]
         if self.trust_index:
-            self._index.prune_missing(key, seen)
-        if known or self.trust_index:
+            self._index.prune_missing(key, plan["seen"])
+        if plan["known"] or self.trust_index:
             self._index.mark_verified(key)
 
         if self.backup_mode == MODE_MIRROR:
-            self._mirror_cleanup(src, target_root, structure, len(seen))
+            self._mirror_cleanup(plan["src"], plan["target_root"], plan["structure"],
+                                 len(plan["seen"]), plan["scan_failed"])
 
         if self.versioning != VERSION_NONE and not self.dry_run:
-            self.prune_versions(target_root)
+            self.prune_versions(plan["target_root"])
 
     def _listdir(self, path):
         delay = 1
@@ -337,6 +383,8 @@ class BackupWorker(QThread):
                 if self.c.entries_seen % self.SCAN_REPORT_EVERY == 0:
                     self._chatter(f"Scanning... {self.c.entries_seen:,} examined, "
                                   f"{self.c.files_found:,} queued")
+                    self.scan_progress.emit(self.c.entries_seen, self.c.files_found,
+                                            self.c.bytes_found, current_src)
 
                 target_path = os.path.join(current_dst, entry.name)
                 try:
@@ -370,10 +418,12 @@ class BackupWorker(QThread):
                             self.reasons[category] = self.reasons.get(category, 0) + 1
                             self.reason_bytes[category] = (
                                 self.reason_bytes.get(category, 0) + st.st_size)
-                        self._queue.put({
+                        self._plan.append({
                             "src": entry.path, "dst": target_path, "why": detail,
                             "size": st.st_size, "mtime": st.st_mtime, "job": key,
                         })
+                        verb = "would copy" if self.dry_run else "queued"
+                        self._chatter(f"{verb} [{detail}]: {entry.path}")
                     else:
                         self.c.skipped += 1
                         self._index_writes.append(
@@ -418,7 +468,6 @@ class BackupWorker(QThread):
                 if not self.is_running:
                     continue
                 if self.dry_run:
-                    self._chatter(f"would copy [{task['why']}]: {task['src']}")
                     with self.c.lock:
                         self.c.files_done += 1
                         self.c.bytes_done += task["size"]
@@ -537,8 +586,10 @@ class BackupWorker(QThread):
 
     def _tick(self, n):
         now = time.time()
-        if (now - self._last_ui) > (1.0 / self.UI_HZ):
-            self._last_ui = now
+        # Its own clock. Sharing one with the per-file lines let the byte
+        # updates, which fire far more often, starve them out of the log.
+        if (now - self._last_tick) > (1.0 / self.UI_HZ):
+            self._last_tick = now
             self.chunk_finished.emit(self.c.bytes_done)
             self.task_stats_ready.emit(self.c.files_found, self.c.bytes_found)
 
@@ -596,8 +647,8 @@ class BackupWorker(QThread):
                 except OSError:
                     pass
 
-    def _mirror_cleanup(self, src, target_root, structure, source_count):
-        if len(self.scan_errors) > self._job_errors:
+    def _mirror_cleanup(self, src, target_root, structure, source_count, scan_failed):
+        if scan_failed:
             self._say("--- CLEANUP SKIPPED: the scan reported errors, so the source "
                       "listing is incomplete. ---")
             return

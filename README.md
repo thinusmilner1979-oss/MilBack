@@ -5,10 +5,13 @@ copying to network shares that are slow, flaky, or both.
 
 ### Features
 
-* **Built for slow shares.** Parallel transfers hide network latency, copying
-  starts on the first file found rather than after the whole tree is scanned,
-  and a local index lets repeat runs skip unchanged files without asking the
+* **Built for slow shares.** Parallel transfers hide network latency, and a
+  local index lets repeat runs skip unchanged files without asking the
   destination about them.
+* **Tells you where it is.** Every job is scanned before the first file is
+  copied, naming each file it queues and why. Once the scan ends the total is
+  known, so the progress that follows is a real fraction rather than a guess
+  that moves backwards when a later job finds more work.
 * **Resilient.** Block-level read retries, retries on directory listings, and
   interrupted transfers resume where they stopped instead of starting over.
 * **Careful with deletions.** Mirror mode refuses to delete when a source

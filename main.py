@@ -2,14 +2,15 @@ import os
 import sys
 import time
 
-from PyQt6.QtCore import QTime, QTimer
-from PyQt6.QtGui import QAction
+from PyQt6.QtCore import Qt, QTime, QTimer
+from PyQt6.QtGui import QAction, QFontMetrics
 from PyQt6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
                              QFileDialog, QGroupBox, QHBoxLayout, QHeaderView,
                              QInputDialog, QLabel, QListWidget, QMainWindow, QMenu,
-                             QMessageBox, QProgressBar, QPushButton, QSpinBox,
-                             QStyle, QSystemTrayIcon, QTableWidget, QTableWidgetItem,
-                             QTextEdit, QTimeEdit, QVBoxLayout, QWidget)
+                             QMessageBox, QProgressBar, QPushButton, QSizePolicy,
+                             QSpinBox, QStyle, QSystemTrayIcon, QTableWidget,
+                             QTableWidgetItem, QTextEdit, QTimeEdit, QVBoxLayout,
+                             QWidget)
 
 import profiles as profile_store
 from engine import (MODE_INCREMENTAL, MODE_MIRROR, MODE_OVERWRITE, VERSION_KEEP,
@@ -32,6 +33,9 @@ class MilBackWindow(QMainWindow):
         self.total_bytes = 0.0
         self.bytes_copied = 0
         self.start_time = time.time()
+        self.copy_start = None
+        self.scanning = False
+        self.dry_run = False
         self._loading = False
 
         self._build_tray()
@@ -142,6 +146,11 @@ class MilBackWindow(QMainWindow):
         pane.addLayout(run_row)
 
         self.stats_label = QLabel("Ready.")
+        # A long path in here must not drag the window wider. Ignored means the
+        # label's preferred width is not allowed to influence the layout.
+        self.stats_label.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                       QSizePolicy.Policy.Preferred)
+        self.stats_label.setMinimumWidth(0)
         pane.addWidget(self.stats_label)
         self.progress_bar = QProgressBar()
         pane.addWidget(self.progress_bar)
@@ -516,12 +525,18 @@ class MilBackWindow(QMainWindow):
 
         self.total_bytes = 0.0
         self.bytes_copied = 0
+        self.scanning = True
+        self.dry_run = dry_run
         self.start_time = time.time()
+        self.copy_start = None
         self.progress_bar.setRange(0, 0)
+        self.set_stats("Scanning...")
 
         self.worker = BackupWorker(settings, name)
         self.worker.progress_update.connect(self.append_log)
         self.worker.error_found.connect(self.append_log)
+        self.worker.scan_progress.connect(self.update_scan_stats)
+        self.worker.scan_finished.connect(self.on_scan_finished)
         self.worker.task_stats_ready.connect(self.update_totals)
         self.worker.chunk_finished.connect(self.update_live_stats)
         self.worker.finished.connect(self.on_complete)
@@ -538,22 +553,57 @@ class MilBackWindow(QMainWindow):
     def append_log(self, line):
         self.log.append(line)
 
-    def update_totals(self, files, total_bytes):
+    def set_stats(self, text):
+        # Trimmed to the width the label already has, so the text can never be
+        # what decides how wide the window is.
+        width = max(self.stats_label.width(), 120)
+        metrics = QFontMetrics(self.stats_label.font())
+        self.stats_label.setText(
+            metrics.elidedText(text, Qt.TextElideMode.ElideMiddle, width))
+        self.stats_label.setToolTip(text)
+
+    def update_scan_stats(self, examined, queued, queued_bytes, folder):
+        # No percentage here on purpose. Nothing knows the total until the scan
+        # has finished, and a bar fed a growing total walks backwards.
+        self.set_stats(
+            f"Scanning  |  {examined:,} examined  |  {queued:,} to copy "
+            f"({human(queued_bytes)})  |  {folder}")
+
+    def on_scan_finished(self, files, total_bytes):
+        self.scanning = False
         self.total_bytes = float(total_bytes) or 1.0
-        if self.progress_bar.maximum() == 0:
-            self.progress_bar.setRange(0, 100)
+        self.copy_start = time.time()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        if not files:
+            self.set_stats("Nothing to copy.")
+            self.progress_bar.setValue(100)
+            return
+        verb = "Would copy" if self.dry_run else "Copying"
+        self.set_stats(f"{verb} {files:,} files  |  {human(total_bytes)}")
+
+    def update_totals(self, files, total_bytes):
+        if not self.scanning:
+            self.total_bytes = float(total_bytes) or 1.0
 
     def update_live_stats(self, bytes_done):
         # The engine sends a running total, not a delta, so a dropped update
         # cannot leave the bar permanently out of step.
         self.bytes_copied = int(bytes_done)
-        if self.total_bytes > 0:
-            percent = min(100, max(0, int(self.bytes_copied / self.total_bytes * 100)))
-            self.progress_bar.setValue(percent)
-            elapsed = max(time.time() - self.start_time, 0.001)
-            self.stats_label.setText(
-                f"{human(self.bytes_copied)} of about {human(self.total_bytes)}  |  "
-                f"{human(self.bytes_copied / elapsed)}/s  |  {percent}%")
+        if self.scanning or self.total_bytes <= 0:
+            return
+        percent = min(100, max(0, int(self.bytes_copied / self.total_bytes * 100)))
+        self.progress_bar.setValue(percent)
+        if self.dry_run:
+            # No rate: a dry run moves nothing, so there is no speed to report.
+            self.set_stats(
+                f"Checking  |  {human(self.bytes_copied)} of "
+                f"{human(self.total_bytes)}  |  {percent}%")
+            return
+        elapsed = max(time.time() - (self.copy_start or self.start_time), 0.001)
+        self.set_stats(
+            f"Copying  |  {human(self.bytes_copied)} of {human(self.total_bytes)}  |  "
+            f"{human(self.bytes_copied / elapsed)}/s  |  {percent}%")
 
     def on_complete(self, found, copied, in_use):
         self.start_btn.setEnabled(True)
